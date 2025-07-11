@@ -66,7 +66,7 @@ def handle_message(event):
                 {"role": "user", "content": user_message}
             ]
         )
-        i_reply = response.choices[0].message.content.strip()
+        ai_reply = response.choices[0].message.content.strip()
 
         # 2. TTS 合成語音（OpenAI TTS API）
         tts_response = requests.post(
