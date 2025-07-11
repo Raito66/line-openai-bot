@@ -16,6 +16,7 @@ from linebot.v3.messaging.models import AudioMessage
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 import openai
 import requests
+from mutagen.mp3 import MP3
 
 app = Flask(__name__)
 
@@ -26,7 +27,6 @@ openai.api_key = os.environ.get('OPENAI_API_KEY')
 configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# 建議在 Heroku Config Vars 設定 HEROKU_BASE_URL
 HEROKU_BASE_URL = os.environ.get("HEROKU_BASE_URL")
 if not HEROKU_BASE_URL:
     raise RuntimeError("請在 Heroku Config Vars 設定 HEROKU_BASE_URL，範例：https://你的heroku-app.herokuapp.com")
@@ -87,11 +87,12 @@ def handle_message(event):
         with open(audio_path, "wb") as f:
             f.write(tts_response.content)
 
-        # 3. 公開語音檔案的網址（Heroku Flask 路由）
-        audio_url = f"{HEROKU_BASE_URL}/static/{audio_filename}"
+        # 3. 用 mutagen 取得 mp3 長度（秒），轉成毫秒
+        audio_info = MP3(audio_path)
+        duration = int(audio_info.info.length * 1000)
 
-        # 4. 估算語音時長（預設4000ms，可用 mutagen/pydub改進）
-        duration = 4000
+        # 4. 公開語音檔案的網址（Heroku Flask 路由）
+        audio_url = f"{HEROKU_BASE_URL}/static/{audio_filename}"
 
         # 5. 回覆 LINE 使用者（文字+語音）
         with ApiClient(configuration) as api_client:
