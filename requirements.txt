@@ -1,4 +1,5 @@
 flask
 openai
-line-bot-sdk
+line-bot-sdk==3.*
 python-dotenv
+requests
