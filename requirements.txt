@@ -3,3 +3,4 @@ openai
 line-bot-sdk==3.*
 python-dotenv
 requests
+mutagen
