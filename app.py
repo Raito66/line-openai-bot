@@ -1,4 +1,5 @@
 import os
+import re
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -48,6 +49,48 @@ TTS_RATE_PERCENT = int(os.environ.get("TTS_RATE_PERCENT", "85"))
 TTS_USE_SSML = os.environ.get("TTS_USE_SSML", "true").lower() in ("1", "true", "yes")
 # 若 SSML 不生效，且想用 pydub 做後處理，設定 TTS_POST_PROCESS=pydub 並確保 pydub 與 ffmpeg 可用
 TTS_POST_PROCESS = os.environ.get("TTS_POST_PROCESS", "").lower()  # "pydub" to enable
+
+# ---------- 新增：簡單語言偵測與 sanitize 函式 ----------
+def detect_lang_simple(text: str):
+    """簡單偵測使用者輸入是否為中文 (zh) 或越南文 (vi)。
+    回傳 'zh'、'vi' 或 None。
+    """
+    if not text:
+        return None
+    # 如果有 CJK 字元 -> 當作中文
+    if re.search(r'[\u4e00-\u9fff]', text):
+        return 'zh'
+    # 越南語常見字符 (đ ă â ê ô ơ ư và một số詞)
+    if re.search(r'[đĐăĂâÂêÊôÔơƠưƯ]', text) or re.search(r'\b(và|không|của|xin|chào|cám|cảm)\b', text, re.I):
+        return 'vi'
+    return None
+
+def sanitize_translation(reply_text: str, target_lang: str):
+    """針對中↔越自動翻譯情境，移除 GPT 可能加入的語言標籤或前綴，保留純翻譯文本。
+    若無法判斷或非中/越情境，回傳原始 reply_text。
+    """
+    if not reply_text:
+        return reply_text
+    s = reply_text.strip()
+
+    # 移除常見語言標示前綴，例如 "Vietnamese:", "[越南語]", "中文：" 等
+    s = re.sub(r'^\s*(?:\[*\s*(?:[Vv]ietnamese|Vietnamese|越南語|Chinese|中文)\s*\]*[:：\-\s]*)', '', s)
+
+    # 如果目標是中文，確保從第一個 CJK 字元開始（避免前面出現英文標示被保留）
+    if target_lang == 'zh':
+        m = re.search(r'[\u4e00-\u9fff]', s)
+        if m:
+            s = s[m.start():].strip()
+    # 若目標是越南語，嘗試移除可能的英文標籤後直接回傳剩餘文字
+    if target_lang == 'vi':
+        s = s.strip()
+
+    # 如果經過清理後變成空字串，fallback 回原始
+    if not s:
+        return reply_text.strip()
+    return s
+
+# ---------- end helper functions ----------
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -99,6 +142,25 @@ def handle_message(event):
             ]
         )
         ai_reply = response.choices[0].message.content.strip()
+        app.logger.info(f"GPT raw reply: {ai_reply!r}")
+
+        # ---------- 使用簡單偵測決定是否要 sanitize ----------
+        detected = detect_lang_simple(user_message)
+        target = None
+        if detected == 'zh':
+            target = 'vi'
+        elif detected == 'vi':
+            target = 'zh'
+
+        if target:
+            sanitized = sanitize_translation(ai_reply, target)
+            app.logger.info(f"Sanitized reply for TTS/text: {sanitized!r}")
+        else:
+            sanitized = ai_reply.strip()
+
+        # 若 sanitize 失敗回傳空，fallback 回原 ai_reply
+        if not sanitized:
+            sanitized = ai_reply.strip()
 
         # 2. TTS 合成語音（OpenAI TTS API）
         # 嘗試使用 SSML 控制語速（若服務支援 SSML）
@@ -119,21 +181,26 @@ def handle_message(event):
                 payload["input_format"] = "ssml"
             else:
                 payload["input"] = input_text
-            return requests.post(
-                "https://api.openai.com/v1/audio/speech",
-                headers={
-                    "Authorization": f"Bearer {openai.api_key}",
-                    "Content-Type": "application/json"
-                },
-                json=payload,
-                timeout=30
-            )
+            try:
+                resp = requests.post(
+                    "https://api.openai.com/v1/audio/speech",
+                    headers={
+                        "Authorization": f"Bearer {openai.api_key}",
+                        "Content-Type": "application/json"
+                    },
+                    json=payload,
+                    timeout=30
+                )
+                return resp
+            except Exception as e:
+                app.logger.warning(f"TTS request exception: {e}")
+                raise
 
         # 優先嘗試 SSML（若設定允許），若失敗則退回純文字 TTS 再做後處理（若啟用）
         tts_response = None
         if TTS_USE_SSML:
             try:
-                tts_response = call_tts_with_text(ai_reply, use_ssml=True)
+                tts_response = call_tts_with_text(sanitized, use_ssml=True)
                 # 如果 API 回傳錯誤狀態，讓後面 fallback 處理
                 if not (200 <= tts_response.status_code < 300):
                     app.logger.warning(f"SSML TTS failed status {tts_response.status_code}, falling back to plain TTS. Response: {tts_response.text}")
@@ -144,7 +211,7 @@ def handle_message(event):
 
         if tts_response is None:
             # 使用純文字 TTS（之後可用 pydub 後處理調整語速）
-            tts_response = call_tts_with_text(ai_reply, use_ssml=False)
+            tts_response = call_tts_with_text(sanitized, use_ssml=False)
 
         # 儲存臨時語音檔
         with open(audio_path, "wb") as f:
@@ -178,11 +245,7 @@ def handle_message(event):
         duration = int(audio_info.info.length * 1000)
 
         # 4. 公開語音檔案的網址（Heroku Flask 路由）
-        # 若使用 post-processed 檔案，仍放在 /tmp 並用原 filename 回傳（若需要改名可修改）
-        # 我們若 post-process 產生 slow_ 檔，這邊改為對外使用 slow_ 名稱（保持一致）
         if final_audio_path != audio_path:
-            # 將最終檔案命名為原始 audio_filename（覆蓋），或直接用 slow_ 檔案名稱公開
-            # 這裡選直接公開 slow_ 檔名
             public_filename = os.path.basename(final_audio_path)
         else:
             public_filename = audio_filename
@@ -196,7 +259,8 @@ def handle_message(event):
                 ReplyMessageRequest(
                     reply_token=event.reply_token,
                     messages=[
-                        TextMessage(text=ai_reply),
+                        # 使用 sanitized 作為文字回覆，避免文字與語音不一致或讓 TTS 讀到前綴
+                        TextMessage(text=sanitized),
                         AudioMessage(
                             original_content_url=audio_url,
                             duration=duration
@@ -205,7 +269,7 @@ def handle_message(event):
                 )
             )
     except Exception as e:
-        print(f"An error occurred: {e}")
+        app.logger.exception(f"An error occurred: {e}")
 
 # 讓 Heroku 可下載 .mp3 語音檔案
 @app.route("/static/<filename>")
