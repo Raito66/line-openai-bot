@@ -131,15 +131,66 @@ def clean_tts_text(text: str):
     if not text:
         return text
     
+    # 擴充的敏感詞彙發音映射 - 確保正確發音
+    pronunciation_map = {
+        # 中文詞彙發音優化
+        '戀足': '戀 足',
+        '足交': '足 交', 
+        '美腿': '美 腿',
+        '蛋蛋': '蛋 蛋',
+        '雞雞': '雞 雞',
+        '陰莖': '陰 莖',
+        '陽具': '陽 具',
+        '老二': '老 二',
+        '屌': '屌',
+        '屁股': '屁 股',
+        '胸部': '胸 部',
+        '奶子': '奶 子',
+        '美腳': '美 腳',
+        '腳交': '腳 交',
+        '踩我': '踩 我',
+        '踢我': '踢 我',
+        '摸我': '摸 我',
+        '親我': '親 我',
+        
+        # 越南文詞彙發音優化
+        'dương vật': 'dương vật',
+        'âm đạo': 'âm đạo', 
+        'của quý': 'của quý',
+        'cặc': 'cặc',
+        'buồi': 'buồi',
+        'lồn': 'lồn',
+        'vú': 'vú',
+        'ngực': 'ngực',
+        'mông': 'mông',
+        'đít': 'đít',
+        'chân': 'chân',
+        'bàn chân': 'bàn chân',
+        'ngón chân': 'ngón chân',
+        'đùi': 'đùi',
+        'bắp đùi': 'bắp đùi',
+        'đá': 'đá',
+        'đạp': 'đạp',
+        'giẫm': 'giẫm',
+        'đụ': 'đụ',
+        'chịch': 'chịch',
+    }
+    
+    # 應用發音調整
+    cleaned_text = text
+    for word, replacement in pronunciation_map.items():
+        cleaned_text = cleaned_text.replace(word, replacement)
+    
     # 移除或替換可能導致 TTS 讀出標點符號的字符
-    cleaned = re.sub(r'[\[\]{}()<>]', ' ', text)  # 移除括號
-    cleaned = re.sub(r'[:：]', '，', cleaned)      # 替換冒號為逗號
-    cleaned = re.sub(r'[!！]', '。', cleaned)      # 替換驚嘆號為句號
+    cleaned_text = re.sub(r'[\[\]{}()<>]', ' ', cleaned_text)  # 移除括號
+    cleaned_text = re.sub(r'[:：]', '，', cleaned_text)      # 替換冒號為逗號
+    cleaned_text = re.sub(r'[!！]', '。', cleaned_text)      # 替換驚嘆號為句號
+    cleaned_text = re.sub(r'[?？]', '。', cleaned_text)      # 替換問號為句號
     
     # 移除多餘空格
-    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    cleaned_text = re.sub(r'\s+', ' ', cleaned_text).strip()
     
-    return cleaned
+    return cleaned_text
 
 # ---------- end helper functions ----------
 
