@@ -43,7 +43,7 @@ if not HEROKU_BASE_URL:
     raise RuntimeError("請在 Heroku Config Vars 設定 HEROKU_BASE_URL，範例：https://你的heroku-app.herokuapp.com")
 
 # 可透過環境變數設定語速（百分比，預設 85 -> 較慢）
-TTS_RATE_PERCENT = int(os.environ.get("TTS_RATE_PERCENT", "85"))
+TTS_RATE_PERCENT = int(os.environ.get("TTS_RATE_PERCENT", "65"))
 # 關閉 SSML：為避免 TTS 把 SSML 標籤念出，暫時強制關閉 SSML（使用純文字 TTS）
 TTS_USE_SSML = False
 # 若 SSML 不生效，且想用 pydub 做後處理，設定 TTS_POST_PROCESS=pydub 並確保 pydub 與 ffmpeg 可用
