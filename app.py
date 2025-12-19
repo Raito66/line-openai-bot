@@ -32,9 +32,9 @@ HEROKU_BASE_URL = os.environ.get("HEROKU_BASE_URL")
 if not HEROKU_BASE_URL:
     raise RuntimeError("請在 Heroku Config Vars 設定 HEROKU_BASE_URL，範例：https://你的heroku-app.herokuapp.com")
 
-# 語速：百分比（0.5~2.0 倍之間的比例，這邊用 65%）
+# 語速：百分比（會傳給 OpenAI TTS 的 speed 參數）
 TTS_RATE_PERCENT = int(os.environ.get("TTS_RATE_PERCENT", "65"))
-TTS_POST_PROCESS = os.environ.get("TTS_POST_PROCESS", "").lower()  # "pydub" to enable
+TTS_POST_PROCESS = os.environ.get("TTS_POST_PROCESS", "").lower()  # "pydub" 啟用後處理
 
 # 可選後處理：pydub
 try:
@@ -53,7 +53,7 @@ def detect_is_chinese(text: str) -> bool:
     """
     if not text:
         return False
-    # 若有不少於 2 個 CJK 字元，視為中文
+    # 至少 2 個 CJK 字元就當作中文
     cjk_chars = re.findall(r'[\u4e00-\u9fff]', text)
     return len(cjk_chars) >= 2
 
@@ -61,8 +61,7 @@ def detect_is_chinese(text: str) -> bool:
 def sanitize_translation(reply_text: str):
     """
     清理 GPT 回覆：避免前綴標籤、引號等多餘內容。
-    由於系統 prompt 會要求只輸出翻譯文字，
-    這裡主要作保險性處理。
+    系統 prompt 已要求只輸出翻譯文字，這裡主要作保險性處理。
     """
     if not reply_text:
         return reply_text
@@ -91,7 +90,7 @@ def sanitize_translation(reply_text: str):
 def clean_tts_text(text: str):
     """
     TTS 專用清理：避免一些括號、過多標點造成怪異讀法。
-    這裡不做重度改字，只做基本格式清理，以保留原意與語氣。
+    不做特定詞彙替換，只做基本格式處理。
     """
     if not text:
         return text
@@ -132,29 +131,50 @@ def callback():
 def handle_message(event):
     user_message = event.message.text
     try:
+        app.logger.info("### Translator bot version: non-chinese -> zh, chinese -> en ###")
+
         # 1. 判斷輸入語言：是否為中文
         is_chinese_input = detect_is_chinese(user_message)
 
         # 根據輸入語言決定翻譯方向
-        # 中文 -> 英文；非中文 -> 中文
+        # 中文 -> 英文；非中文（包含日文、英文、韓文等任何語言）-> 繁體中文
         if is_chinese_input:
             system_prompt = """
-你是一個專業的翻譯助手。規則：
+你是一個專業的翻譯助手。規則（非常重要，必須嚴格遵守）：
 
-- 使用者輸入是中文（繁體或簡體），你只需要把它翻譯成自然、流暢且專業的英文。
-- 僅輸出英文翻譯句子本身，不要任何多餘說明、標籤、引號、語言名稱或括號。
-- 專有名詞、商標和程式碼請在合理情況下保留原樣。
-- 性相關或挑逗內容也要如實翻譯，但保持中性、自然的語氣。
+1. 使用者輸入是中文（繁體或簡體）時，你只需要把它翻譯成自然、流暢且專業的英文。
+
+2. 回覆時「只輸出英文翻譯句子本身」：
+   - 不要任何多餘說明
+   - 不要加上「翻譯：」「Translation:」這類前綴
+   - 不要輸出語言名稱
+   - 不要加引號或括號包住整句
+
+3. 專有名詞、商標和程式碼在合理情況下保留原樣。
+
+4. 性相關或挑逗內容也要如實翻譯，但保持中性、自然的語氣。
 """
             target_lang = "en"
         else:
             system_prompt = """
-你是一個專業的翻譯助手。規則：
+你是一個專業的翻譯助手。規則（非常重要，必須嚴格遵守）：
 
-- 使用者輸入不是中文時，請判斷原文語言，並將其翻譯成自然、流暢且專業的繁體中文。
-- 僅輸出繁體中文翻譯句子本身，不要任何多餘說明、標籤、引號、語言名稱或括號。
-- 專有名詞、商標和程式碼請在合理情況下保留原樣。
-- 性相關或挑逗內容也要如實翻譯，但保持中性、自然的語氣。
+1. 使用者輸入「不是中文」時，無論原文是日文、英文、韓文、越南文或任何其他語言，
+   一律翻譯成自然、流暢且專業的「繁體中文」。
+
+2. 絕對不要要求使用者改用中文輸入，也不要回覆類似
+   「這不是中文，請提供中文句子」或「請改用中文」等內容。
+   不論原文是什麼語言，都直接翻譯成繁體中文。
+
+3. 回覆時「只輸出翻譯後的繁體中文句子本身」：
+   - 不要任何多餘說明
+   - 不要加上「翻譯：」「中文翻譯：」「Translation:」這類前綴
+   - 不要輸出語言名稱
+   - 不要加引號或括號包住整句
+
+4. 專有名詞、商標和程式碼在合理情況下保留原樣。
+
+5. 性相關或挑逗內容也要如實翻譯，但保持中性、自然的語氣。
 """
             target_lang = "zh"
 
