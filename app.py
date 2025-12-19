@@ -44,7 +44,7 @@ except Exception:
     PydubAvailable = False
 
 
-# ---------- 語言偵測與文字清理 ----------
+# ---------- 語言偵測、糾正與文字清理 ----------
 
 def detect_lang_by_gpt(text: str) -> str:
     """
@@ -59,7 +59,7 @@ def detect_lang_by_gpt(text: str) -> str:
 
     try:
         resp = openai.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4o-mini",  # 只做語言分類，小模型足夠
             messages=[
                 {
                     "role": "system",
@@ -82,35 +82,6 @@ def detect_lang_by_gpt(text: str) -> str:
     except Exception as e:
         app.logger.warning(f"Language detect failed, fallback to 'other': {e}")
         return "other"
-
-
-def sanitize_translation(reply_text: str):
-    """
-    清理 GPT 回覆：避免前綴標籤、引號等多餘內容。
-    系統 prompt 已要求只輸出翻譯文字，這裡主要作保險性處理。
-    """
-    if not reply_text:
-        return reply_text
-
-    s = reply_text.strip()
-
-    # 常見前綴標籤
-    patterns_to_remove = [
-        r'^\s*(?:翻譯|Translation|譯文|中文翻譯|英文翻譯)[:：\-\s]*',
-        r'^\s*\[?(Chinese|English|中文|英文)\]?\s*[:：\-\s]*',
-    ]
-    for pattern in patterns_to_remove:
-        s = re.sub(pattern, '', s, flags=re.I)
-
-    # 去掉首尾成對引號
-    if (s.startswith('"') and s.endswith('"')) or \
-       (s.startswith('「') and s.endswith('」')) or \
-       (s.startswith('『') and s.endswith('』')):
-        s = s[1:-1].strip()
-
-    # 多餘空白
-    s = re.sub(r'\s+', ' ', s).strip()
-    return s or reply_text.strip()
 
 
 def clean_tts_text(text: str):
@@ -157,56 +128,57 @@ def callback():
 def handle_message(event):
     user_message = event.message.text
     try:
-        app.logger.info("### Translator bot v2: zh->en, other->zh (GPT lang detect) ###")
+        app.logger.info("### Translator bot v4: zh->en, other->zh, with correction + show source ###")
         app.logger.info(f"User message: {user_message!r}")
 
         # 1. 用 GPT 判斷是否為中文
         lang = detect_lang_by_gpt(user_message)
         app.logger.info(f"Detected lang: {lang}")
 
+        # 2. 根據語言決定「先糾正＋翻譯」的 system prompt
         if lang == "zh":
-            # 中文 -> 英文
+            # 中文 → 修正成正確中文 → 翻成英文
             system_prompt = """
-你是一個專業的翻譯助手。規則（非常重要，必須嚴格遵守）：
+你是一個專業的翻譯與校正助手。請依照以下格式回覆（非常重要，必須嚴格遵守）：
 
-1. 使用者輸入是中文（繁體或簡體）時，你只需要把它翻譯成自然、流暢且專業的英文。
+1. 使用者輸入是中文（繁體或簡體）時：
+   - 先把它校正成文法正確、自然流暢的中文（修正錯字與不自然用語）。
+   - 再把「校正後的中文」翻譯成自然、流暢且專業的英文。
 
-2. 回覆時「只輸出英文翻譯句子本身」：
-   - 不要任何多餘說明
-   - 不要加上「翻譯：」「Translation:」這類前綴
-   - 不要輸出語言名稱
-   - 不要加引號或括號包住整句
+2. 回覆時一定要使用以下 JSON 格式，鍵名必須完全一致，不要多也不要少：
+   {
+     "corrected_source": "<校正後的中文句子>",
+     "translation": "<對應的英文翻譯>"
+   }
 
-3. 專有名詞、商標和程式碼在合理情況下保留原樣。
-
-4. 性相關或挑逗內容也要如實翻譯，但保持中性、自然的語氣。
+3. 不要在 JSON 外多加任何文字、說明或標註。
+4. 專有名詞、商標和程式碼在合理情況下保留原樣。
+5. 性相關或挑逗內容也要如實翻譯，但保持中性、自然的語氣。
 """
             target_lang = "en"
         else:
-            # 任何非中文（包含日文、英文等） -> 繁體中文
+            # 非中文（例如日文、英文） → 先在該語言中修正 → 再翻成繁體中文
             system_prompt = """
-你是一個專業的翻譯助手。規則（非常重要，必須嚴格遵守）：
+你是一個專業的翻譯與校正助手。請依照以下格式回覆（非常重要，必須嚴格遵守）：
 
-1. 使用者輸入「不是中文」時，無論原文是日文、英文、韓文、越南文或任何其他語言，
-   一律翻譯成自然、流暢且專業的「繁體中文」。
+1. 使用者輸入「不是中文」時，無論原文是日文、英文、韓文、越南文或其他語言：
+   - 先把原文校正成該語言中「文法正確、拼字正確、自然流暢」的句子，
+     例如：日文的助詞錯誤、英文拼字錯誤，都先修正。
+   - 使用「校正後的原文」翻譯成自然、流暢且專業的「繁體中文」。
 
-2. 絕對不要要求使用者改用中文輸入，也不要回覆類似
-   「這不是中文，請提供中文句子」或「請改用中文」等內容。
-   不論原文是什麼語言，都直接翻譯成繁體中文。
+2. 回覆時一定要使用以下 JSON 格式，鍵名必須完全一致，不要多也不要少：
+   {
+     "corrected_source": "<校正後的原文句子（保持原語言）>",
+     "translation": "<對應的繁體中文翻譯>"
+   }
 
-3. 回覆時「只輸出翻譯後的繁體中文句子本身」：
-   - 不要任何多餢說明
-   - 不要加上「翻譯：」「中文翻譯：」「Translation:」這類前綴
-   - 不要輸出語言名稱
-   - 不要加引號或括號包住整句
-
+3. 不要在 JSON 外多加任何文字、說明或標註。
 4. 專有名詞、商標和程式碼在合理情況下保留原樣。
-
 5. 性相關或挑逗內容也要如實翻譯，但保持中性、自然的語氣。
 """
             target_lang = "zh"
 
-        # 2. GPT 翻譯
+        # 3. GPT 校正 + 翻譯（回傳 JSON）
         response = openai.chat.completions.create(
             model="gpt-4",
             messages=[
@@ -215,19 +187,40 @@ def handle_message(event):
             ],
             temperature=0.3
         )
-        ai_reply = response.choices[0].message.content.strip()
-        app.logger.info(f"GPT raw reply: {ai_reply!r}")
+        raw_reply = response.choices[0].message.content.strip()
+        app.logger.info(f"GPT raw reply: {raw_reply!r}")
 
-        # 3. 清理翻譯文字
-        sanitized = sanitize_translation(ai_reply)
-        if not sanitized:
-            sanitized = ai_reply.strip()
+        # 4. 嘗試解析 JSON
+        import json
+        corrected_source = user_message
+        translation = raw_reply
+        try:
+            data = json.loads(raw_reply)
+            if isinstance(data, dict):
+                corrected_source = data.get("corrected_source", corrected_source)
+                translation = data.get("translation", translation)
+        except Exception as e:
+            app.logger.warning(f"Failed to parse JSON from GPT reply: {e}")
 
-        # 4. TTS 文字清理
-        tts_text = clean_tts_text(sanitized)
-        app.logger.info(f"Final TTS text: {tts_text!r}")
+        # 5. 組合給使用者看的文字（兩行）
+        if lang == "zh":
+            # 使用者原本是中文
+            display_text = (
+                f"修正後原文 (中文)：{corrected_source}\n"
+                f"翻譯 (英文)：{translation}"
+            )
+        else:
+            # 使用者原本不是中文（可能是日文、英文…）
+            display_text = (
+                f"修正後原文 (原語言)：{corrected_source}\n"
+                f"翻譯 (繁體中文)：{translation}"
+            )
 
-        # 5. 根據「輸出語言」選擇 voice
+        # 6. TTS 只念翻譯那一行
+        tts_text = clean_tts_text(translation)
+        app.logger.info(f"TTS text: {tts_text!r}")
+
+        # 7. 根據「輸出語言」選擇 voice
         if target_lang == "zh":
             tts_voice = "alloy"   # 中文表現較好
         else:
@@ -260,7 +253,7 @@ def handle_message(event):
                 app.logger.warning(f"TTS request exception: {e}")
                 raise
 
-        # 6. 呼叫 TTS
+        # 8. 呼叫 TTS
         tts_response = call_tts_with_text(tts_text, tts_voice)
 
         if tts_response.status_code != 200:
@@ -271,7 +264,7 @@ def handle_message(event):
                 line_bot_api.reply_message(
                     ReplyMessageRequest(
                         reply_token=event.reply_token,
-                        messages=[TextMessage(text=sanitized)]
+                        messages=[TextMessage(text=display_text)]
                     )
                 )
             return
@@ -282,18 +275,18 @@ def handle_message(event):
 
         final_audio_path = audio_path
 
-        # 7. pydub 後處理（選用）
+        # 9. pydub 後處理（選用）
         if TTS_POST_PROCESS == "pydub" and PydubAvailable:
             try:
                 sound = AudioSegment.from_file(final_audio_path, format="mp3")
                 sound = sound.normalize()
-                processed_path = f"/tmp/processed_{audio_filename}"
+                processed_path = f"/tmp/processed_" + audio_filename
                 sound.export(processed_path, format="mp3")
                 final_audio_path = processed_path
             except Exception as e:
                 app.logger.warning(f"pydub processing failed: {e}")
 
-        # 8. 取得音檔長度
+        # 10. 取得音檔長度
         try:
             audio_info = MP3(final_audio_path)
             duration = int(audio_info.info.length * 1000)
@@ -301,7 +294,7 @@ def handle_message(event):
             app.logger.warning(f"Failed to get audio duration: {e}")
             duration = 3000  # fallback
 
-        # 9. 對外網址
+        # 11. 對外網址
         if final_audio_path != audio_path:
             public_filename = os.path.basename(final_audio_path)
         else:
@@ -309,14 +302,14 @@ def handle_message(event):
 
         audio_url = f"{HEROKU_BASE_URL}/static/{public_filename}"
 
-        # 10. 回覆 LINE 使用者（文字 + 語音）
+        # 12. 回覆 LINE 使用者（文字 + 語音）
         with ApiClient(configuration) as api_client:
             line_bot_api = MessagingApi(api_client)
             line_bot_api.reply_message(
                 ReplyMessageRequest(
                     reply_token=event.reply_token,
                     messages=[
-                        TextMessage(text=sanitized),
+                        TextMessage(text=display_text),
                         AudioMessage(
                             original_content_url=audio_url,
                             duration=duration
