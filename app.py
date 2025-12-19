@@ -46,16 +46,42 @@ except Exception:
 
 # ---------- 語言偵測與文字清理 ----------
 
-def detect_is_chinese(text: str) -> bool:
+def detect_lang_by_gpt(text: str) -> str:
     """
-    判斷輸入是否「主要是中文」：
-    - 若包含足量 CJK 字元則視為中文。
+    用小模型請 GPT 幫忙判斷語言。
+    回傳:
+      - 'zh'   : 中文（繁體或簡體）
+      - 'other': 其他語言（包含日文、英文、韓文等）
+    偵測失敗時預設回 'other'（保險起見一律翻成中文）。
     """
-    if not text:
-        return False
-    # 至少 2 個 CJK 字元就當作中文
-    cjk_chars = re.findall(r'[\u4e00-\u9fff]', text)
-    return len(cjk_chars) >= 2
+    if not text or not text.strip():
+        return "other"
+
+    try:
+        resp = openai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a language detector. "
+                        "If the user's message is in Chinese (Traditional or Simplified), reply with exactly 'zh'. "
+                        "If it is any other language (including Japanese, English, Korean, etc.), reply with exactly 'other'. "
+                        "Do not add anything else."
+                    ),
+                },
+                {"role": "user", "content": text},
+            ],
+            temperature=0.0,
+        )
+        ans = resp.choices[0].message.content.strip().lower()
+        if ans == "zh":
+            return "zh"
+        else:
+            return "other"
+    except Exception as e:
+        app.logger.warning(f"Language detect failed, fallback to 'other': {e}")
+        return "other"
 
 
 def sanitize_translation(reply_text: str):
@@ -131,14 +157,15 @@ def callback():
 def handle_message(event):
     user_message = event.message.text
     try:
-        app.logger.info("### Translator bot version: non-chinese -> zh, chinese -> en ###")
+        app.logger.info("### Translator bot v2: zh->en, other->zh (GPT lang detect) ###")
+        app.logger.info(f"User message: {user_message!r}")
 
-        # 1. 判斷輸入語言：是否為中文
-        is_chinese_input = detect_is_chinese(user_message)
+        # 1. 用 GPT 判斷是否為中文
+        lang = detect_lang_by_gpt(user_message)
+        app.logger.info(f"Detected lang: {lang}")
 
-        # 根據輸入語言決定翻譯方向
-        # 中文 -> 英文；非中文（包含日文、英文、韓文等任何語言）-> 繁體中文
-        if is_chinese_input:
+        if lang == "zh":
+            # 中文 -> 英文
             system_prompt = """
 你是一個專業的翻譯助手。規則（非常重要，必須嚴格遵守）：
 
@@ -156,6 +183,7 @@ def handle_message(event):
 """
             target_lang = "en"
         else:
+            # 任何非中文（包含日文、英文等） -> 繁體中文
             system_prompt = """
 你是一個專業的翻譯助手。規則（非常重要，必須嚴格遵守）：
 
@@ -167,7 +195,7 @@ def handle_message(event):
    不論原文是什麼語言，都直接翻譯成繁體中文。
 
 3. 回覆時「只輸出翻譯後的繁體中文句子本身」：
-   - 不要任何多餘說明
+   - 不要任何多餢說明
    - 不要加上「翻譯：」「中文翻譯：」「Translation:」這類前綴
    - 不要輸出語言名稱
    - 不要加引號或括號包住整句
@@ -200,12 +228,10 @@ def handle_message(event):
         app.logger.info(f"Final TTS text: {tts_text!r}")
 
         # 5. 根據「輸出語言」選擇 voice
-        #   - 翻成英文 -> 英文 voice 比較自然：nova
-        #   - 翻成中文 -> 中文表現較好的：alloy
         if target_lang == "zh":
-            tts_voice = "alloy"
+            tts_voice = "alloy"   # 中文表現較好
         else:
-            tts_voice = "nova"
+            tts_voice = "nova"    # 英文聲線較自然
 
         audio_filename = f"{event.reply_token}.mp3"
         audio_path = f"/tmp/{audio_filename}"
