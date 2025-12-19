@@ -51,7 +51,7 @@ def detect_lang_by_gpt(text: str) -> str:
     用小模型請 GPT 幫忙判斷語言。
     回傳:
       - 'zh'   : 中文（繁體或簡體）
-      - 'other': 其他語言（包含日文、英文、韓文等）
+      - 'other': 其他語言（包含日文、英文、韓文、越南文…）
     偵測失敗時預設回 'other'。
     """
     if not text or not text.strip():
@@ -155,37 +155,39 @@ def callback():
 def handle_message(event):
     user_message = event.message.text
     try:
-        app.logger.info("### Translator bot v7 ###")
+        app.logger.info("### Translator bot v8 (zh -> en+ja, other -> zh, dual TTS for zh) ###")
         app.logger.info(f"User message: {user_message!r}")
 
         # 1. 判斷中文 / 非中文
         lang = detect_lang_by_gpt(user_message)
         app.logger.info(f"Detected lang: {lang}")
 
-        # 2. system prompt（已加：英文句尾須有標點）
+        # 2. system prompt
         if lang == "zh":
-            # 中文 → 修正中文 → 翻譯成英文
+            # 中文 → 修正中文 → 同時翻成英文 & 日文
             system_prompt = """
 你是一個專業的翻譯與校正助手。請依照以下格式回覆（非常重要，必須嚴格遵守）：
 
 1. 使用者輸入是中文（繁體或簡體）時：
    - 先把它校正成文法正確、自然流暢的中文（修正錯字與不自然用語）。
-   - 再把「校正後的中文」翻譯成自然、流暢且專業的英文。
+   - 再把「校正後的中文」同時翻譯成自然、流暢且專業的英文與日文。
 
 2. 回覆時一定要使用以下 JSON 格式，鍵名必須完全一致，不要多也不要少：
    {
      "corrected_source": "<校正後的中文句子>",
-     "translation": "<對應的英文翻譯>"
+     "translation_en": "<對應的英文翻譯>",
+     "translation_ja": "<對應的日文翻譯>"
    }
 
 3. 不要在 JSON 外多加任何文字、說明或標註。
 4. 專有名詞、商標和程式碼在合理情況下保留原樣。
 5. 性相關或挑逗內容也要如實翻譯，但保持中性、自然的語氣。
 6. 當你輸出英文翻譯時，如果是完整的句子，必須在句尾加上適當的標點符號（通常是句號 .，疑問句用 ?，感嘆句用 !）。
+7. 當你輸出日文翻譯時，請使用自然的日文，句尾可以使用「。」也可以不用，但要保持自然。
 """
-            target_lang = "en"
+            target_lang = "en_ja"  # 我們自己用來識別：中文輸入有兩個翻譯
         else:
-            # 非中文（英文/日文等） → 修正原文 → 翻成繁中
+            # 非中文（英文/日文/韓文/越南文等） → 修正原文 → 翻成繁中
             system_prompt = """
 你是一個專業的翻譯與校正助手。請依照以下格式回覆（非常重要，必須嚴格遵守）：
 
@@ -222,41 +224,54 @@ def handle_message(event):
         # 4. 解析 JSON
         import json
         corrected_source = user_message
-        translation = raw_reply
+        translation = raw_reply  # fallback
+        translation_en = None
+        translation_ja = None
+
         try:
             data = json.loads(raw_reply)
             if isinstance(data, dict):
                 corrected_source = data.get("corrected_source", corrected_source)
-                translation = data.get("translation", translation)
+                if lang == "zh":
+                    translation_en = data.get("translation_en")
+                    translation_ja = data.get("translation_ja")
+                    # 給後面 TTS fallback 用（優先英文）
+                    translation = translation_en or translation_ja or translation
+                else:
+                    translation = data.get("translation", translation)
         except Exception as e:
             app.logger.warning(f"Failed to parse JSON from GPT reply: {e}")
 
         # 5. 判斷有沒有「實質修改」
-        #    條件 1：忽略多餘空白後，內容真的不同（字 / 標點有差）
         base_changed = normalize_spaces(corrected_source) != normalize_spaces(user_message)
 
-        #    條件 2：原文是英文時，即使只缺句尾標點也算問題
         punct_missing = False
         if lang == "other":
             letters = len(re.findall(r'[A-Za-z]', corrected_source))
             kana = len(re.findall(r'[ぁ-ゖァ-ヺ]', corrected_source))
-            if letters > kana:  # 英文字母比假名多，視為英文句子
+            if letters > kana:
                 punct_missing = missing_english_punctuation(corrected_source)
 
         changed = base_changed or punct_missing
 
         # 6. 組合顯示文字
         if lang == "zh":
-            # 中文 → 英文
+            # 中文 → 英文 + 日文
+            lines = []
             if changed:
-                display_text = (
-                    f"修正後原文 (中文)：{corrected_source}\n"
-                    f"翻譯 (英文)：{translation}"
-                )
-            else:
-                display_text = f"翻譯 (英文)：{translation}"
+                lines.append(f"修正後原文 (中文)：{corrected_source}")
+            if translation_en:
+                lines.append(f"翻譯 (英文)：{translation_en}")
+            if translation_ja:
+                lines.append(f"翻譯 (日文)：{translation_ja}")
+
+            if not lines:
+                # 理論上不會發生，但保底
+                lines.append(f"翻譯 (英文)：{translation}")
+
+            display_text = "\n".join(lines)
         else:
-            # 其他語言 → 繁體中文
+            # 其他語言 → 繁體中文（舊邏輯）
             if changed:
                 display_text = (
                     f"修正後原文 (原語言)：{corrected_source}\n"
@@ -265,14 +280,20 @@ def handle_message(event):
             else:
                 display_text = f"翻譯 (繁體中文)：{translation}"
 
-        # 7. TTS 只念翻譯
-        tts_text = clean_tts_text(translation)
-        app.logger.info(f"TTS text: {tts_text!r}")
+        # 7. 準備 TTS：中文輸入 → 兩個語音 (英文 + 日文)，其他 → 一個中文語音
+        tts_jobs = []  # 每個元素：(text, voice, suffix)
 
-        tts_voice = "alloy" if target_lang == "zh" else "nova"
+        if lang == "zh":
+            # 中文輸入：產英文＋日文兩種語音
+            if translation_en:
+                tts_jobs.append((clean_tts_text(translation_en), "alloy", "en"))
+            if translation_ja:
+                tts_jobs.append((clean_tts_text(translation_ja), "alloy", "ja"))
+        else:
+            # 其他語言：只念繁體中文翻譯
+            tts_jobs.append((clean_tts_text(translation), "alloy", "zh"))
 
-        audio_filename = f"{event.reply_token}.mp3"
-        audio_path = f"/tmp/{audio_filename}"
+        audio_files = []  # [(public_filename, duration_ms)]
 
         def call_tts_with_text(input_text, voice):
             try:
@@ -297,65 +318,68 @@ def handle_message(event):
                 app.logger.warning(f"TTS request exception: {e}")
                 raise
 
-        # 8. 呼叫 TTS
-        tts_response = call_tts_with_text(tts_text, tts_voice)
+        # 8. 逐個產 TTS 檔案
+        for text_for_tts, voice, suffix in tts_jobs:
+            if not text_for_tts:
+                continue
 
-        if tts_response.status_code != 200:
-            app.logger.error(f"TTS failed: {tts_response.text}")
-            with ApiClient(configuration) as api_client:
-                line_bot_api = MessagingApi(api_client)
-                line_bot_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[TextMessage(text=display_text)]
-                    )
-                )
-            return
+            base_name = f"{event.reply_token}_{suffix}.mp3"
+            audio_path = f"/tmp/{base_name}"
 
-        with open(audio_path, "wb") as f:
-            f.write(tts_response.content)
+            tts_response = call_tts_with_text(text_for_tts, voice)
+            if tts_response.status_code != 200:
+                app.logger.error(f"TTS failed for {suffix}: {tts_response.text}")
+                continue
 
-        final_audio_path = audio_path
+            with open(audio_path, "wb") as f:
+                f.write(tts_response.content)
 
-        # 9. pydub 後處理（選用）
-        if TTS_POST_PROCESS == "pydub" and PydubAvailable:
+            final_audio_path = audio_path
+
+            # pydub 後處理（選用）
+            if TTS_POST_PROCESS == "pydub" and PydubAvailable:
+                try:
+                    sound = AudioSegment.from_file(final_audio_path, format="mp3")
+                    sound = sound.normalize()
+                    processed_path = f"/tmp/processed_{base_name}"
+                    sound.export(processed_path, format="mp3")
+                    final_audio_path = processed_path
+                except Exception as e:
+                    app.logger.warning(f"pydub processing failed ({suffix}): {e}")
+
+            # 取得長度
             try:
-                sound = AudioSegment.from_file(final_audio_path, format="mp3")
-                sound = sound.normalize()
-                processed_path = f"/tmp/processed_" + audio_filename
-                sound.export(processed_path, format="mp3")
-                final_audio_path = processed_path
+                audio_info = MP3(final_audio_path)
+                duration = int(audio_info.info.length * 1000)
             except Exception as e:
-                app.logger.warning(f"pydub processing failed: {e}")
+                app.logger.warning(f"Failed to get audio duration ({suffix}): {e}")
+                duration = 3000
 
-        # 10. 取得音檔長度
-        try:
-            audio_info = MP3(final_audio_path)
-            duration = int(audio_info.info.length * 1000)
-        except Exception as e:
-            app.logger.warning(f"Failed to get audio duration: {e}")
-            duration = 3000
+            if final_audio_path != audio_path:
+                public_filename = os.path.basename(final_audio_path)
+            else:
+                public_filename = base_name
 
-        if final_audio_path != audio_path:
-            public_filename = os.path.basename(final_audio_path)
-        else:
-            public_filename = audio_filename
+            audio_files.append((public_filename, duration))
 
-        audio_url = f"{HEROKU_BASE_URL}/static/{public_filename}"
-
-        # 11. 回 LINE（文字 + 語音）
+        # 9. 回 LINE（文字 + 一或兩個語音）
         with ApiClient(configuration) as api_client:
             line_bot_api = MessagingApi(api_client)
+
+            messages = [TextMessage(text=display_text)]
+            for public_filename, duration in audio_files:
+                audio_url = f"{HEROKU_BASE_URL}/static/{public_filename}"
+                messages.append(
+                    AudioMessage(
+                        original_content_url=audio_url,
+                        duration=duration
+                    )
+                )
+
             line_bot_api.reply_message(
                 ReplyMessageRequest(
                     reply_token=event.reply_token,
-                    messages=[
-                        TextMessage(text=display_text),
-                        AudioMessage(
-                            original_content_url=audio_url,
-                            duration=duration
-                        )
-                    ]
+                    messages=messages
                 )
             )
 
