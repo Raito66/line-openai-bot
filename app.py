@@ -52,14 +52,14 @@ def detect_lang_by_gpt(text: str) -> str:
     回傳:
       - 'zh'   : 中文（繁體或簡體）
       - 'other': 其他語言（包含日文、英文、韓文等）
-    偵測失敗時預設回 'other'（保險起見一律翻成中文）。
+    偵測失敗時預設回 'other'。
     """
     if not text or not text.strip():
         return "other"
 
     try:
         resp = openai.chat.completions.create(
-            model="gpt-4o-mini",  # 只做語言分類，小模型足夠
+            model="gpt-4o-mini",
             messages=[
                 {
                     "role": "system",
@@ -87,40 +87,53 @@ def detect_lang_by_gpt(text: str) -> str:
 def clean_tts_text(text: str):
     """
     TTS 專用清理：避免一些括號、過多標點造成怪異讀法。
-    不做特定詞彙替換，只做基本格式處理。
     """
     if not text:
         return text
 
     cleaned_text = text
-
-    # 移除括號類符號（避免讀出）
     cleaned_text = re.sub(r'[{}\[\]<>]', ' ', cleaned_text)
-
-    # 把多個標點做一點規整，避免連續奇怪停頓
     cleaned_text = re.sub(r'[!！]+', '！', cleaned_text)
     cleaned_text = re.sub(r'[?？]+', '？', cleaned_text)
     cleaned_text = re.sub(r'[，,]+', '，', cleaned_text)
     cleaned_text = re.sub(r'[。\.]+', '。', cleaned_text)
-
-    # 多餘空白
     cleaned_text = re.sub(r'\s+', ' ', cleaned_text).strip()
-
     return cleaned_text
 
 
 def normalize_spaces(s: str) -> str:
     """
-    比較用的標準化：
+    比較用標準化：
     - 去掉首尾空白
     - 把多個空白壓成一個
-    其餘（標點、大小寫）都保留，算差異。
+    其餘（標點、大小寫）全部保留，用來判斷是否真的有修改。
     """
     if s is None:
         return ""
     s = s.strip()
     s = re.sub(r'\s+', ' ', s)
     return s
+
+
+def missing_english_punctuation(s: str) -> bool:
+    """
+    檢查「看起來像英文句子」是否缺少結尾標點：
+    - 若句子裡有英文字母，且最後一個非空白字元不是 . ! ? 則視為「缺標點」。
+    只用在原文為英文時。
+    """
+    if not s:
+        return False
+
+    s = s.rstrip()
+    has_alpha = re.search(r'[A-Za-z]', s) is not None
+    if not has_alpha:
+        return False
+
+    last_char = s[-1]
+    if last_char in ['.', '!', '?']:
+        return False
+
+    return True
 
 
 # ---------- Flask + LINE webhook ----------
@@ -142,16 +155,16 @@ def callback():
 def handle_message(event):
     user_message = event.message.text
     try:
-        app.logger.info("### Translator bot v6: zh->en, other->zh, correction shown only if meaningfully changed ###")
+        app.logger.info("### Translator bot v7 ###")
         app.logger.info(f"User message: {user_message!r}")
 
-        # 1. 用 GPT 判斷是否為中文
+        # 1. 判斷中文 / 非中文
         lang = detect_lang_by_gpt(user_message)
         app.logger.info(f"Detected lang: {lang}")
 
-        # 2. 根據語言決定「先糾正＋翻譯」的 system prompt
+        # 2. system prompt（已加：英文句尾須有標點）
         if lang == "zh":
-            # 中文 → 修正成正確中文 → 翻成英文
+            # 中文 → 修正中文 → 翻譯成英文
             system_prompt = """
 你是一個專業的翻譯與校正助手。請依照以下格式回覆（非常重要，必須嚴格遵守）：
 
@@ -168,10 +181,11 @@ def handle_message(event):
 3. 不要在 JSON 外多加任何文字、說明或標註。
 4. 專有名詞、商標和程式碼在合理情況下保留原樣。
 5. 性相關或挑逗內容也要如實翻譯，但保持中性、自然的語氣。
+6. 當你輸出英文翻譯時，如果是完整的句子，必須在句尾加上適當的標點符號（通常是句號 .，疑問句用 ?，感嘆句用 !）。
 """
             target_lang = "en"
         else:
-            # 非中文（例如日文、英文） → 先在該語言中修正 → 再翻成繁體中文
+            # 非中文（英文/日文等） → 修正原文 → 翻成繁中
             system_prompt = """
 你是一個專業的翻譯與校正助手。請依照以下格式回覆（非常重要，必須嚴格遵守）：
 
@@ -189,10 +203,11 @@ def handle_message(event):
 3. 不要在 JSON 外多加任何文字、說明或標註。
 4. 專有名詞、商標和程式碼在合理情況下保留原樣。
 5. 性相關或挑逗內容也要如實翻譯，但保持中性、自然的語氣。
+6. 如果校正後的原文是一個「英文完整句子」，請在句尾加上適當的標點符號（通常是句號 .，疑問句用 ?，感嘆句用 !）。
 """
             target_lang = "zh"
 
-        # 3. GPT 校正 + 翻譯（回傳 JSON）
+        # 3. GPT 校正 + 翻譯
         response = openai.chat.completions.create(
             model="gpt-4",
             messages=[
@@ -204,7 +219,7 @@ def handle_message(event):
         raw_reply = response.choices[0].message.content.strip()
         app.logger.info(f"GPT raw reply: {raw_reply!r}")
 
-        # 4. 嘗試解析 JSON
+        # 4. 解析 JSON
         import json
         corrected_source = user_message
         translation = raw_reply
@@ -216,12 +231,23 @@ def handle_message(event):
         except Exception as e:
             app.logger.warning(f"Failed to parse JSON from GPT reply: {e}")
 
-        # 判斷有沒有真的「被修改」
-        # 只忽略多餘空白，其餘（標點、大小寫）都算差異
-        changed = normalize_spaces(corrected_source) != normalize_spaces(user_message)
+        # 5. 判斷有沒有「實質修改」
+        #    條件 1：忽略多餘空白後，內容真的不同（字 / 標點有差）
+        base_changed = normalize_spaces(corrected_source) != normalize_spaces(user_message)
 
-        # 5. 組合給使用者看的文字
+        #    條件 2：原文是英文時，即使只缺句尾標點也算問題
+        punct_missing = False
+        if lang == "other":
+            letters = len(re.findall(r'[A-Za-z]', corrected_source))
+            kana = len(re.findall(r'[ぁ-ゖァ-ヺ]', corrected_source))
+            if letters > kana:  # 英文字母比假名多，視為英文句子
+                punct_missing = missing_english_punctuation(corrected_source)
+
+        changed = base_changed or punct_missing
+
+        # 6. 組合顯示文字
         if lang == "zh":
+            # 中文 → 英文
             if changed:
                 display_text = (
                     f"修正後原文 (中文)：{corrected_source}\n"
@@ -230,6 +256,7 @@ def handle_message(event):
             else:
                 display_text = f"翻譯 (英文)：{translation}"
         else:
+            # 其他語言 → 繁體中文
             if changed:
                 display_text = (
                     f"修正後原文 (原語言)：{corrected_source}\n"
@@ -238,21 +265,16 @@ def handle_message(event):
             else:
                 display_text = f"翻譯 (繁體中文)：{translation}"
 
-        # 6. TTS 只念翻譯那一部分
+        # 7. TTS 只念翻譯
         tts_text = clean_tts_text(translation)
         app.logger.info(f"TTS text: {tts_text!r}")
 
-        # 7. 根據「輸出語言」選擇 voice
-        if target_lang == "zh":
-            tts_voice = "alloy"   # 中文表現較好
-        else:
-            tts_voice = "nova"    # 英文聲線較自然
+        tts_voice = "alloy" if target_lang == "zh" else "nova"
 
         audio_filename = f"{event.reply_token}.mp3"
         audio_path = f"/tmp/{audio_filename}"
 
         def call_tts_with_text(input_text, voice):
-            """呼叫 TTS API，使用純文字輸入"""
             try:
                 resp = requests.post(
                     "https://api.openai.com/v1/audio/speech",
@@ -280,7 +302,6 @@ def handle_message(event):
 
         if tts_response.status_code != 200:
             app.logger.error(f"TTS failed: {tts_response.text}")
-            # TTS 失敗 → 只回文字
             with ApiClient(configuration) as api_client:
                 line_bot_api = MessagingApi(api_client)
                 line_bot_api.reply_message(
@@ -291,7 +312,6 @@ def handle_message(event):
                 )
             return
 
-        # 儲存 mp3
         with open(audio_path, "wb") as f:
             f.write(tts_response.content)
 
@@ -314,9 +334,8 @@ def handle_message(event):
             duration = int(audio_info.info.length * 1000)
         except Exception as e:
             app.logger.warning(f"Failed to get audio duration: {e}")
-            duration = 3000  # fallback
+            duration = 3000
 
-        # 11. 對外網址
         if final_audio_path != audio_path:
             public_filename = os.path.basename(final_audio_path)
         else:
@@ -324,7 +343,7 @@ def handle_message(event):
 
         audio_url = f"{HEROKU_BASE_URL}/static/{public_filename}"
 
-        # 12. 回覆 LINE 使用者（文字 + 語音）
+        # 11. 回 LINE（文字 + 語音）
         with ApiClient(configuration) as api_client:
             line_bot_api = MessagingApi(api_client)
             line_bot_api.reply_message(
@@ -342,7 +361,6 @@ def handle_message(event):
 
     except Exception as e:
         app.logger.exception(f"An error occurred: {e}")
-        # 錯誤時至少回傳文字訊息
         try:
             with ApiClient(configuration) as api_client:
                 line_bot_api = MessagingApi(api_client)
@@ -356,7 +374,6 @@ def handle_message(event):
             pass
 
 
-# 讓 Heroku 可下載 .mp3 語音檔案
 @app.route("/static/<filename>")
 def serve_audio(filename):
     return send_from_directory("/tmp", filename)
