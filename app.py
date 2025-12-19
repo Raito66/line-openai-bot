@@ -109,6 +109,20 @@ def clean_tts_text(text: str):
     return cleaned_text
 
 
+def normalize_spaces(s: str) -> str:
+    """
+    比較用的標準化：
+    - 去掉首尾空白
+    - 把多個空白壓成一個
+    其餘（標點、大小寫）都保留，算差異。
+    """
+    if s is None:
+        return ""
+    s = s.strip()
+    s = re.sub(r'\s+', ' ', s)
+    return s
+
+
 # ---------- Flask + LINE webhook ----------
 
 @app.route("/callback", methods=['POST'])
@@ -128,7 +142,7 @@ def callback():
 def handle_message(event):
     user_message = event.message.text
     try:
-        app.logger.info("### Translator bot v5: zh->en, other->zh, correction only shown when changed ###")
+        app.logger.info("### Translator bot v6: zh->en, other->zh, correction shown only if meaningfully changed ###")
         app.logger.info(f"User message: {user_message!r}")
 
         # 1. 用 GPT 判斷是否為中文
@@ -202,8 +216,9 @@ def handle_message(event):
         except Exception as e:
             app.logger.warning(f"Failed to parse JSON from GPT reply: {e}")
 
-        # 判斷有沒有真的「被修改」（只比對文字，去掉首尾空白）
-        changed = corrected_source.strip() != user_message.strip()
+        # 判斷有沒有真的「被修改」
+        # 只忽略多餘空白，其餘（標點、大小寫）都算差異
+        changed = normalize_spaces(corrected_source) != normalize_spaces(user_message)
 
         # 5. 組合給使用者看的文字
         if lang == "zh":
