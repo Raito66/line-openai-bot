@@ -10,6 +10,7 @@ from linebot.v3.messaging import (
     Configuration,
     ApiClient,
     MessagingApi,
+    MessagingApiBlob,  # <-- 新增：用來抓語音、圖片等二進位內容
     ReplyMessageRequest,
     TextMessage
 )
@@ -68,16 +69,13 @@ def detect_lang_by_gpt(text: str) -> str:
     只分兩種：
       - 'zh'    : 中文（繁體 or 簡體）
       - 'other' : 其他語言（英文、日文、韓文、越南文... 全部算這一類）
-
-    這邊不用自己寫正則判斷語言，完全交給 GPT 小模型處理。
     """
     if not text or not text.strip():
-        # 空字串 → 直接當作 non-zh 處理
         return "other"
 
     try:
         resp = openai.chat.completions.create(
-            model="gpt-4o-mini",  # 小模型，便宜又快
+            model="gpt-4o-mini",
             messages=[
                 {
                     "role": "system",
@@ -98,7 +96,6 @@ def detect_lang_by_gpt(text: str) -> str:
         else:
             return "other"
     except Exception as e:
-        # 偵測失敗，就保守一點當成 "other"（翻成中文那條）
         app.logger.warning(f"[LANG_DETECT_ERROR] {e}, fallback to 'other'")
         return "other"
 
@@ -106,48 +103,23 @@ def detect_lang_by_gpt(text: str) -> str:
 def clean_tts_text(text: str) -> str:
     """
     把要丟給 TTS 的文字稍微清理一下，避免朗讀起來太怪。
-
-    做的事情：
-      - 拿掉一些括號類符號
-      - 把一串 !!! / ??? / ...... 合併成一個
-      - 清掉多餘空白
-
-    不會動到真正的內容，只是讓朗讀時的停頓比較自然。
     """
     if not text:
         return text
 
     cleaned_text = text
-
-    # 去掉容易讓 TTS 唸出奇怪停頓的括號
     cleaned_text = re.sub(r'[{}\[\]<>]', ' ', cleaned_text)
-
-    # 合併多個驚嘆號 / 問號 / 逗號 / 句號
     cleaned_text = re.sub(r'[!！]+', '！', cleaned_text)
     cleaned_text = re.sub(r'[?？]+', '？', cleaned_text)
     cleaned_text = re.sub(r'[，,]+', '，', cleaned_text)
     cleaned_text = re.sub(r'[。\.]+', '。', cleaned_text)
-
-    # 多餘空白 → 單一空白
     cleaned_text = re.sub(r'\s+', ' ', cleaned_text).strip()
-
     return cleaned_text
 
 
 def normalize_spaces(s: str) -> str:
     """
-    用來比較「原文」與「修正後原文」的版本。
-
-    我們只想「忽略空白差異」，所以做：
-      1. 去掉頭尾空白
-      2. 把中間連續多個空白，縮成一個空白
-
-    不會改變：
-      - 標點
-      - 整個字串內容
-      - 大小寫
-
-    這樣只要標點或字不同，就會被視為「真的有修改」。
+    只標準化「空白」，用來比較原文和修正後原文是否有實質差異。
     """
     if s is None:
         return ""
@@ -158,45 +130,26 @@ def normalize_spaces(s: str) -> str:
 
 def missing_english_punctuation(s: str) -> bool:
     """
-    檢查一個字串「如果看起來像英文句子」，最後面有沒有句尾標點。
-
-    規則：
-      - 若字串中含有英文字母 (A-Z / a-z)
-      - 且最後一個非空白字元不是 . 或 ! 或 ?
-      → 回傳 True（代表缺少句尾標點）
-
-    只在「原文是英文」時使用，用來嚴格要求英文完整句必須有標點。
+    看起來像英文句子，最後卻沒有 . ! ? 就回傳 True。
     """
     if not s:
         return False
 
     s = s.rstrip()
-
-    # 先檢查裡面有沒有英文字母
     has_alpha = re.search(r'[A-Za-z]', s) is not None
     if not has_alpha:
-        # 沒有英文字，就不當英文句處理
         return False
 
     last_char = s[-1]
     if last_char in ['.', '!', '?']:
-        # 已經有適當句尾標點
         return False
 
-    # 沒有句尾標點
     return True
 
 
 def call_tts_with_text(input_text: str, voice: str):
     """
     呼叫 OpenAI TTS API，把文字轉語音。
-
-    參數：
-      - input_text : 要念的文字
-      - voice      : 使用哪一個 voice 名稱（例如 'alloy'）
-
-    回傳：
-      - requests.Response 物件（裡面的 content 就是 mp3）
     """
     try:
         resp = requests.post(
@@ -227,26 +180,22 @@ def call_tts_with_text(input_text: str, voice: str):
 
 def translate_text_with_logging(user_text: str):
     """
-    給一段「純文字」，走完整的「偵測語言 → 校正 → 翻譯 → 判斷 changed → 組 display_text → 準備 TTS」流程。
-
-    這個函式給兩個地方共用：
-      1. 使用者輸入文字的時候
-      2. 使用者輸入語音 → 先轉文字 → 再丟進來
-
-    回傳：
-      - display_text : 要回給使用者的整段文字（沒有加「語音辨識原文」那一行，語音那邊會自己加）
-      - tts_jobs     : 給 TTS 用的任務列表，每一個元素長這樣：
-                       (text_for_tts, voice, suffix)
+    核心翻譯流程（文字／語音共用）：
+      1. 語言偵測（中文 or 其他）
+      2. 根據語言選 prompt
+      3. GPT 校正 + 翻譯（回 JSON）
+      4. 判斷是否有實質修改 (changed)
+      5. 組 display_text（顯示用文字）
+      6. 準備 TTS 任務列表
     """
     app.logger.info(f"[USER_TEXT] {user_text!r}")
 
-    # 1. 判斷這段文字是中文還是其他語言
+    # 1. 判斷中文 / 非中文
     lang = detect_lang_by_gpt(user_text)
     app.logger.info(f"[LANG_DETECTED] {lang}")
 
-    # 2. 根據語言決定 system prompt（決定要生成什麼 JSON 結構）
+    # 2. system prompt
     if lang == "zh":
-        # 中文 → 修正中文 → 同時翻譯成英文 + 日文
         system_prompt = """
 你是一個專業的翻譯與校正助手。請依照以下格式回覆（非常重要，必須嚴格遵守）：
 
@@ -267,9 +216,8 @@ def translate_text_with_logging(user_text: str):
 6. 當你輸出英文翻譯時，如果是完整的句子，必須在句尾加上適當的標點符號（通常是句號 .，疑問句用 ?，感嘆句用 !）。
 7. 當你輸出日文翻譯時，請使用自然的日文，句尾可以使用「。」也可以不用，但要保持自然。
 """
-        target_lang = "en_ja"  # 自訂標記：代表這次會有英文 + 日文翻譯
+        target_lang = "en_ja"
     else:
-        # 非中文 → 修正原文 → 翻譯成繁體中文
         system_prompt = """
 你是一個專業的翻譯與校正助手。請依照以下格式回覆（非常重要，必須嚴格遵守）：
 
@@ -291,7 +239,7 @@ def translate_text_with_logging(user_text: str):
 """
         target_lang = "zh"
 
-    # 3. 呼叫 OpenAI：用 gpt-4 做「校正 + 翻譯」
+    # 3. GPT 校正 + 翻譯
     response = openai.chat.completions.create(
         model="gpt-4",
         messages=[
@@ -303,12 +251,12 @@ def translate_text_with_logging(user_text: str):
     raw_reply = response.choices[0].message.content.strip()
     app.logger.info(f"[GPT_RAW_REPLY] {raw_reply!r}")
 
-    # 4. 嘗試把 GPT 回傳內容當作 JSON 解析
+    # 4. 解析 JSON
     import json
-    corrected_source = user_text     # 預設：假裝沒修正
-    translation = raw_reply         # 預設翻譯：整段回傳（避免 JSON 解析失敗時沒東西）
-    translation_en = None           # 中文情況下的英文翻譯
-    translation_ja = None           # 中文情況下的日文翻譯
+    corrected_source = user_text
+    translation = raw_reply
+    translation_en = None
+    translation_ja = None
 
     try:
         data = json.loads(raw_reply)
@@ -317,14 +265,13 @@ def translate_text_with_logging(user_text: str):
             if lang == "zh":
                 translation_en = data.get("translation_en")
                 translation_ja = data.get("translation_ja")
-                # 若英文/日文其中一個缺，就用另一個當 fallback
                 translation = translation_en or translation_ja or translation
             else:
                 translation = data.get("translation", translation)
     except Exception as e:
         app.logger.warning(f"[JSON_PARSE_ERROR] {e}")
 
-    # 5. 把修正後原文跟翻譯內容寫進 log，方便除錯
+    # log 校正後與翻譯
     if lang == "zh":
         app.logger.info(f"[CORRECTED_ZH] {corrected_source!r}")
         app.logger.info(f"[TRANSLATION_EN] {translation_en!r}")
@@ -333,25 +280,19 @@ def translate_text_with_logging(user_text: str):
         app.logger.info(f"[CORRECTED_ORIG] {corrected_source!r}")
         app.logger.info(f"[TRANSLATION_ZH] {translation!r}")
 
-    # 6. 判斷這次有沒有「實質修改」
-    #    只忽略空白差異，標點/文字差異都算
+    # 5. 判斷是否有實質修改
     base_changed = normalize_spaces(corrected_source) != normalize_spaces(user_text)
-
-    # 若原文是英文，再加一條規則：沒有句尾標點也當作有問題
     punct_missing = False
     if lang == "other":
-        # 粗略判斷是不是英文：英文字母多過日文假名，就當英文
         letters = len(re.findall(r'[A-Za-z]', corrected_source))
         kana = len(re.findall(r'[ぁ-ゖァ-ヺ]', corrected_source))
         if letters > kana:
             punct_missing = missing_english_punctuation(corrected_source)
-
     changed = base_changed or punct_missing
     app.logger.info(f"[CHANGED_FLAG] changed={changed}, base={base_changed}, punct_missing={punct_missing}")
 
-    # 7. 組成要顯示給使用者看的文字 display_text
+    # 6. 組 display_text
     if lang == "zh":
-        # 中文 → 英文 + 日文
         lines = []
         if changed:
             lines.append(f"修正後原文 (中文)：{corrected_source}")
@@ -359,14 +300,10 @@ def translate_text_with_logging(user_text: str):
             lines.append(f"翻譯 (英文)：{translation_en}")
         if translation_ja:
             lines.append(f"翻譯 (日文)：{translation_ja}")
-
         if not lines:
-            # 理論上不會發生（至少會有英文或日文），這裡只是保底
             lines.append(f"翻譯 (英文)：{translation}")
-
         display_text = "\n".join(lines)
     else:
-        # 非中文 → 繁體中文
         if changed:
             display_text = (
                 f"修正後原文 (原語言)：{corrected_source}\n"
@@ -377,34 +314,22 @@ def translate_text_with_logging(user_text: str):
 
     app.logger.info(f"[DISPLAY_TEXT] {display_text!r}")
 
-    # 8. 準備 TTS 任務列表 tts_jobs
-    #    每一項格式：(要念的文字, voice 名稱, 檔名後綴 suffix)
+    # 7. 準備 TTS jobs
     tts_jobs = []
     if lang == "zh":
-        # 中文：同時產英文＋日文兩段語音
         if translation_en:
             tts_jobs.append((clean_tts_text(translation_en), "alloy", "en"))
         if translation_ja:
             tts_jobs.append((clean_tts_text(translation_ja), "alloy", "ja"))
     else:
-        # 非中文：只產一段「繁體中文翻譯」的語音
         tts_jobs.append((clean_tts_text(translation), "alloy", "zh"))
 
-    # 把 display_text + tts_jobs 傳回給呼叫者（文字處理/語音處理共用）
     return display_text, tts_jobs
 
 
 def run_tts_jobs(tts_jobs, reply_token):
     """
-    根據 tts_jobs 清單，一個一個呼叫 TTS API 產 mp3 檔。
-
-    參數：
-      - tts_jobs   : [(text_for_tts, voice, suffix), ...]
-      - reply_token: 用來組出獨特檔名，避免不同訊息衝突
-
-    回傳：
-      - audio_files: [(public_filename, duration_ms), ...]
-                     供後面組合 LINE 的 AudioMessage 使用
+    執行一組 TTS job，回傳所有產好的 mp3 檔名＋長度。
     """
     audio_files = []
 
@@ -415,19 +340,16 @@ def run_tts_jobs(tts_jobs, reply_token):
         base_name = f"{reply_token}_{suffix}.mp3"
         audio_path = f"/tmp/{base_name}"
 
-        # 呼叫 TTS API
         tts_response = call_tts_with_text(text_for_tts, voice)
         if tts_response.status_code != 200:
             app.logger.error(f"[TTS_FAILED] suffix={suffix}, body={tts_response.text}")
             continue
 
-        # 把回傳的 mp3 內容寫到 /tmp
         with open(audio_path, "wb") as f:
             f.write(tts_response.content)
 
         final_audio_path = audio_path
 
-        # 若有啟用 pydub，做個 Normalize 等後處理
         if TTS_POST_PROCESS == "pydub" and PydubAvailable:
             try:
                 sound = AudioSegment.from_file(final_audio_path, format="mp3")
@@ -438,15 +360,13 @@ def run_tts_jobs(tts_jobs, reply_token):
             except Exception as e:
                 app.logger.warning(f"[PYDUB_ERROR] suffix={suffix}, error={e}")
 
-        # 讀取音檔長度（毫秒），LINE 的 AudioMessage 需要這個欄位
         try:
             audio_info = MP3(final_audio_path)
             duration = int(audio_info.info.length * 1000)
         except Exception as e:
             app.logger.warning(f"[MP3_DURATION_ERROR] suffix={suffix}, error={e}")
-            duration = 3000  # 若讀取失敗，就先給 3 秒當預設
+            duration = 3000
 
-        # 若有產生 processed_ 開頭的檔案，要用那個檔名
         if final_audio_path != audio_path:
             public_filename = os.path.basename(final_audio_path)
         else:
@@ -458,15 +378,11 @@ def run_tts_jobs(tts_jobs, reply_token):
 
 
 # =========================================================
-# Flask / LINE Webhook 入口
+# /callback 入口
 # =========================================================
 
 @app.route("/callback", methods=['POST'])
 def callback():
-    """
-    LINE 平台會把所有訊息 POST 到這個 /callback。
-    我們只做驗證簽名，然後交給 handler。
-    """
     signature = request.headers['X-Line-Signature']
     body = request.get_data(as_text=True)
     app.logger.info("[REQUEST_BODY] " + body)
@@ -481,32 +397,19 @@ def callback():
 
 
 # =========================================================
-# 文字訊息處理：使用者打字訊息
+# 處理文字訊息
 # =========================================================
 
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_text_message(event):
-    """
-    收到「文字訊息」時會進到這裡。
-
-    步驟：
-      1. 取出文字
-      2. 丟給 translate_text_with_logging 做翻譯
-      3. 執行 TTS，產生語音檔
-      4. 回覆：文字 + 語音
-    """
     user_message = event.message.text
     app.logger.info("### TEXT MESSAGE ###")
     app.logger.info(f"[USER_TEXT_RAW] {user_message!r}")
 
     try:
-        # 共用核心：校正 + 翻譯 + 組 display + 準備 TTS 任務
         display_text, tts_jobs = translate_text_with_logging(user_message)
-
-        # 實際呼叫 TTS，產生 mp3 檔資訊
         audio_files = run_tts_jobs(tts_jobs, event.reply_token)
 
-        # 組合要回給 LINE 的訊息
         with ApiClient(configuration) as api_client:
             line_bot_api = MessagingApi(api_client)
 
@@ -526,7 +429,6 @@ def handle_text_message(event):
                     messages=messages
                 )
             )
-
     except Exception as e:
         app.logger.exception(f"[HANDLE_TEXT_ERROR] {e}")
         try:
@@ -539,40 +441,28 @@ def handle_text_message(event):
                     )
                 )
         except Exception:
-            # 如果連回覆都失敗，只能放棄（可能 reply_token 過期）
             pass
 
 
 # =========================================================
-# 語音訊息處理：使用者錄音
+# 處理語音訊息
 # =========================================================
 
 @handler.add(MessageEvent, message=AudioMessageContent)
 def handle_audio_message(event):
-    """
-    收到「語音訊息」時會進到這裡。
-
-    流程：
-      1. 從 LINE 把語音檔下載到 /tmp
-      2. 呼叫 OpenAI Whisper 做語音轉文字（ASR）
-      3. 把轉出來的文字丟進 translate_text_with_logging（跟文字流程一模一樣）
-      4. 執行 TTS，產生語音檔
-      5. 回覆：顯示「語音辨識原文 + 翻譯結果」＋ 語音
-    """
     app.logger.info("### AUDIO MESSAGE ###")
     message_id = event.message.id
     app.logger.info(f"[USER_AUDIO_ID] {message_id}")
 
-    # 1. 下載 LINE 語音檔到 /tmp
-    audio_path = f"/tmp/{message_id}.m4a"  # LINE 語音預設是 m4a
+    # 1. 從 LINE 下載語音檔到 /tmp
+    audio_path = f"/tmp/{message_id}.m4a"
     try:
         with ApiClient(configuration) as api_client:
-            line_bot_api = MessagingApi(api_client)
-            # 下載語音內容（串流）
-            content = line_bot_api.get_message_content(message_id)
+            blob_api = MessagingApiBlob(api_client)  # <-- 用 Blob API 取二進位內容
+            content_bytes = blob_api.get_message_content(message_id)  # 直接拿到 bytes
+
             with open(audio_path, 'wb') as fd:
-                for chunk in content.iter_content():
-                    fd.write(chunk)
+                fd.write(content_bytes)
     except Exception as e:
         app.logger.exception(f"[DOWNLOAD_AUDIO_ERROR] {e}")
         try:
@@ -588,13 +478,12 @@ def handle_audio_message(event):
             pass
         return
 
-    # 2. 使用 OpenAI Whisper 把語音轉成文字
+    # 2. 語音轉文字 (Whisper)
     try:
         with open(audio_path, "rb") as f:
             transcript_resp = openai.audio.transcriptions.create(
                 model="whisper-1",
                 file=f,
-                # response_format="text"：只要純文字就好
                 response_format="text"
             )
         transcript_text = transcript_resp.strip()
@@ -614,12 +503,11 @@ def handle_audio_message(event):
             pass
         return
 
-    # 3. 把轉出來的文字丟進共用翻譯函式
+    # 3. 把轉出來的文字丟進共用翻譯流程
     try:
         display_text, tts_jobs = translate_text_with_logging(transcript_text)
         audio_files = run_tts_jobs(tts_jobs, event.reply_token)
 
-        # 顯示文字最上面先加一行「語音辨識原文」
         final_display = f"語音辨識原文：{transcript_text}\n" + display_text
 
         with ApiClient(configuration) as api_client:
@@ -641,7 +529,6 @@ def handle_audio_message(event):
                     messages=messages
                 )
             )
-
     except Exception as e:
         app.logger.exception(f"[HANDLE_AUDIO_ERROR] {e}")
         try:
@@ -658,26 +545,20 @@ def handle_audio_message(event):
 
 
 # =========================================================
-# 提供靜態音檔下載的路由（給 LINE 播放用）
+# 提供靜態音檔下載
 # =========================================================
 
 @app.route("/static/<filename>")
 def serve_audio(filename):
-    """
-    透過這個路由讓 LINE 能下載我們存在 /tmp 的 mp3 檔。
-    """
     return send_from_directory("/tmp", filename)
 
 
 # =========================================================
-# 本機 / Heroku 啟動入口
+# 啟動
 # =========================================================
 
 if __name__ == "__main__":
     import logging
-    # 把 log level 設成 INFO，這樣前面 app.logger.info 的東西都會出現
     logging.basicConfig(level=logging.INFO)
-
     port = int(os.environ.get("PORT", 5000))
-    # 0.0.0.0 讓 Heroku / Docker 都可以訪問
     app.run(host="0.0.0.0", port=port)
