@@ -128,7 +128,7 @@ def callback():
 def handle_message(event):
     user_message = event.message.text
     try:
-        app.logger.info("### Translator bot v4: zh->en, other->zh, with correction + show source ###")
+        app.logger.info("### Translator bot v5: zh->en, other->zh, correction only shown when changed ###")
         app.logger.info(f"User message: {user_message!r}")
 
         # 1. 用 GPT 判斷是否為中文
@@ -202,21 +202,28 @@ def handle_message(event):
         except Exception as e:
             app.logger.warning(f"Failed to parse JSON from GPT reply: {e}")
 
-        # 5. 組合給使用者看的文字（兩行）
-        if lang == "zh":
-            # 使用者原本是中文
-            display_text = (
-                f"修正後原文 (中文)：{corrected_source}\n"
-                f"翻譯 (英文)：{translation}"
-            )
-        else:
-            # 使用者原本不是中文（可能是日文、英文…）
-            display_text = (
-                f"修正後原文 (原語言)：{corrected_source}\n"
-                f"翻譯 (繁體中文)：{translation}"
-            )
+        # 判斷有沒有真的「被修改」（只比對文字，去掉首尾空白）
+        changed = corrected_source.strip() != user_message.strip()
 
-        # 6. TTS 只念翻譯那一行
+        # 5. 組合給使用者看的文字
+        if lang == "zh":
+            if changed:
+                display_text = (
+                    f"修正後原文 (中文)：{corrected_source}\n"
+                    f"翻譯 (英文)：{translation}"
+                )
+            else:
+                display_text = f"翻譯 (英文)：{translation}"
+        else:
+            if changed:
+                display_text = (
+                    f"修正後原文 (原語言)：{corrected_source}\n"
+                    f"翻譯 (繁體中文)：{translation}"
+                )
+            else:
+                display_text = f"翻譯 (繁體中文)：{translation}"
+
+        # 6. TTS 只念翻譯那一部分
         tts_text = clean_tts_text(translation)
         app.logger.info(f"TTS text: {tts_text!r}")
 
